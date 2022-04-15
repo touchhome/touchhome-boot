@@ -1,0 +1,16 @@
+rootDir: /opt/touchhome
+artifactoryFilesURL: https://touchhome.jfrog.io/artifactory/files-remote
+
+touchhome:
+  disableSecurity: false
+  version: @project.version@
+  httpPort: 9119
+  serverSiteURL: https://touchhome.org
+  checkConnectivityURL: www.google.com
+
+spring:
+  banner:
+    location: classpath:/banner.txt
+
+server:
+  port: 9111
