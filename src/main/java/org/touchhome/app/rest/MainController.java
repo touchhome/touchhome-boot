@@ -2,10 +2,12 @@ package org.touchhome.app.rest;
 
 import lombok.*;
 import lombok.extern.log4j.Log4j2;
+import org.apache.commons.codec.digest.DigestUtils;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.web.bind.annotation.*;
 import org.touchhome.app.ble.BluetoothBundleService;
 import org.touchhome.app.ble.WebSocketConfig;
+import org.touchhome.app.hardware.StartupHardwareRepository;
 import org.touchhome.bundle.api.hardware.other.MachineHardwareRepository;
 import org.touchhome.common.exception.NotFoundException;
 import org.touchhome.common.exception.ServerException;
@@ -13,11 +15,15 @@ import org.touchhome.common.model.ProgressBar;
 import org.touchhome.common.util.CommonUtils;
 import org.touchhome.common.util.Curl;
 
+import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+
+import static org.touchhome.common.util.CommonUtils.OBJECT_MAPPER;
 
 @Log4j2
 @RestController
@@ -28,6 +34,7 @@ public class MainController {
     private final BluetoothBundleService bluetoothBundleService;
     private final SimpMessagingTemplate messagingTemplate;
     private final MachineHardwareRepository machineHardwareRepository;
+    private final StartupHardwareRepository startupHardwareRepository;
     private boolean installingApp;
 
     @GetMapping("/auth/status")
@@ -46,49 +53,149 @@ public class MainController {
     }
 
     @SneakyThrows
-    @PostMapping("/app/downloadAndInstall")
-    public void downloadAndInstall(@RequestBody DownloadAndInstallRequest request) {
+    @PostMapping("/app/config/user")
+    public void setUserPassword(@RequestBody UserPasswordRequest request) {
+        Files.write(CommonUtils.getRootPath().resolve("user_password.conf"), OBJECT_MAPPER.writeValueAsBytes(request),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+    }
+
+    @SneakyThrows
+    @PostMapping("/app/config/finish")
+    public void finishConfiguration() {
+        log.info("Update /etc/systemd/system/touchhome.service");
+        // ProcessBuilder pb = new ProcessBuilder(new String[]{"sed", "-i", "'s/boot/core/g'", "/etc/systemd/system/touchhome.service"});
+        machineHardwareRepository.executeEcho("sed -i 's/boot/core/g' /etc/systemd/system/touchhome.service");
+        //  progressBar.progress(100D, "Installation finished.");
+            /*if (process.exitValue() == 0) {
+                progressBar.progress(100D, "Installation finished. System reboot fired. Please, reload page in 5 minute...");
+                machineHardwareRepository.reboot();
+            } else {
+                progressBar.progress(100D, "Something went wrong with installing.");
+            }*/
+    }
+
+    @GetMapping("/app/config")
+    public DeviceConfig getConfiguration() throws IOException {
+        DeviceConfig deviceConfig = new DeviceConfig();
+        deviceConfig.hasApp = Files.exists(CommonUtils.getRootPath().resolve("touchhome-core.jar"));
+        Path prvKey = CommonUtils.getRootPath().resolve("init_private_key");
+        deviceConfig.hasKeystore = Files.exists(prvKey);
+        deviceConfig.hasInitSetup = isInitSetupDone();
+        deviceConfig.keystoreDate = deviceConfig.hasKeystore ? new Date(Files.getLastModifiedTime(prvKey).toMillis()) : null;
+        deviceConfig.hasUserPassword = Files.exists(CommonUtils.getRootPath().resolve("user_password.conf"));
+        return deviceConfig;
+    }
+
+    @PostMapping("/app/config/init")
+    public void initialSetup() {
+        ProgressBar progressBar = (progress, message) ->
+                messagingTemplate.convertAndSend(WebSocketConfig.DESTINATION_PREFIX + "-global", new Progress(Progress.Type.init, progress, message));
+        try {
+            if (!isInitSetupDone()) {
+                machineHardwareRepository.executeEcho("sudo apt-get update");
+                progressBar.progress(20, "");
+                machineHardwareRepository.executeEcho("sudo apt-get full-upgrade");
+                progressBar.progress(50, "");
+                machineHardwareRepository.executeEcho("sudo apt-get install wiringpi");
+                progressBar.progress(60, "");
+                installPostgreSql();
+            }
+            progressBar.progress(100, "Done.");
+        } catch (Exception ex) {
+            progressBar.progress(100, "Error: " + CommonUtils.getErrorMessage(ex));
+            throw new ServerException(ex);
+        }
+    }
+
+    private boolean isInitSetupDone() {
+        return machineHardwareRepository.isSoftwareInstalled("psql");
+    }
+
+    private void installPostgreSql() {
+        machineHardwareRepository.executeEcho("sudo apt -y install postgresql");
+        for (String config : CommonUtils.readFile("configurePostgresql.conf")) {
+            config = config.replace("$PSQL_CONF_PATH", "/etc/postgresql/9.6/main");
+            machineHardwareRepository.executeEcho(config);
+        }
+        if (!startupHardwareRepository.isPostgreSQLRunning()) {
+            throw new ServerException("Postgresql is not running");
+        }
+        machineHardwareRepository.executeEcho("sudo -u postgres /usr/local/pgsql/bin/psql -c \"ALTER user postgres WITH PASSWORD 'password'\"");
+        machineHardwareRepository.executeEcho("sudo -u postgres /usr/local/pgsql/bin/psql -c \"CREATE USER replicator REPLICATION LOGIN CONNECTION LIMIT 1000 ENCRYPTED PASSWORD 'password'\"");
+    }
+
+    @SneakyThrows
+    @PostMapping("/app/config/keystore")
+    public void setKeystore(@RequestBody KeyStoreRequest keyStoreRequest) {
+        Path ssh = CommonUtils.getRootPath().resolve("ssh");
+        Files.write(ssh.resolve("id_rsa_touchhome"), keyStoreRequest.getPrvKey(),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+        Files.write(ssh.resolve("id_rsa_touchhome.pub"), keyStoreRequest.getPubKey(),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+        Files.write(CommonUtils.getRootPath().resolve("init_private_key"), keyStoreRequest.getKs(),
+                StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
+    }
+
+    @SneakyThrows
+    @PostMapping("/app/config/downloadApp")
+    public void downloadApp() {
         if (installingApp) {
             throw new ServerException("App already installing...");
+        }
+        ProgressBar progressBar = (progress, message) ->
+                messagingTemplate.convertAndSend(WebSocketConfig.DESTINATION_PREFIX + "-global", new Progress(Progress.Type.download, progress, message));
+        Path targetPath = CommonUtils.getRootPath().resolve("touchhome-core.jar");
+        if (Files.exists(targetPath)) {
+            progressBar.progress(100D, "App already downloaded.");
+            return;
         }
         try {
             this.installingApp = true;
             log.info("Installing application...");
             GitHubDescription gitHubDescription = Curl.get("https://api.github.com/repos/touchhome/touchhome-core/releases/latest", GitHubDescription.class);
+
+            String md5HashValue = getExpectedMD5Hash(gitHubDescription);
+
             GitHubDescription.Asset asset = gitHubDescription.assets.stream().filter(a -> a.name.equals("touchhome.jar")).findAny().orElse(null);
             if (asset == null) {
-                throw new NotFoundException("Unable to find touchhome.jar asset from server");
+                throw new NotFoundException("Unable to find touchhome-code.jar asset from server");
             }
-            Path targetPath = CommonUtils.getRootPath().resolve("touchhome.jar");
-            ProgressBar progressBar = (progress, message) ->
-                    messagingTemplate.convertAndSend(WebSocketConfig.DESTINATION_PREFIX + "-global", new Progress(progress, message));
             log.info("Downloading touchhome.jar to <{}>", targetPath);
             Curl.downloadWithProgress(asset.browser_download_url, targetPath, progressBar);
-            Files.write(CommonUtils.getRootPath().resolve("init_config.txt"), CommonUtils.OBJECT_MAPPER.writeValueAsBytes(request),
-                    StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.TRUNCATE_EXISTING);
 
-            log.info("Update /etc/systemd/system/touchhome.service");
-            String[] command = {"sed", "-i", "'s/boot/core/g'", "/etc/systemd/system/touchhome.service"};
-            ProcessBuilder pb = new ProcessBuilder(command);
-            pb.redirectErrorStream(true);
-            Process process = pb.start();
-            process.waitFor();
-
-            if (process.exitValue() == 0) {
-                progressBar.progress(100D, "Installation finished. System reboot fired. Please, reload page in 5 minute...");
-                machineHardwareRepository.reboot();
-            } else {
-                progressBar.progress(100D, "Something went wrong with installing.");
+            // test downloaded file md5 hash
+            if (!md5HashValue.equals(DigestUtils.md5Hex(Files.newInputStream(targetPath)))) {
+                Files.delete(targetPath);
+                throw new ServerException("Downloaded file corrupted");
             }
-        } finally {
             log.info("App installation finished");
+        } finally {
             installingApp = false;
         }
     }
 
+    private String getExpectedMD5Hash(GitHubDescription gitHubDescription) {
+        GitHubDescription.Asset md5Asset = gitHubDescription.assets.stream().filter(a -> a.name.equals("md5.hex")).findAny().orElse(null);
+        if (md5Asset == null) {
+            throw new NotFoundException("Unable to find md5.hex asset from server");
+        }
+        return new String(Curl.download(md5Asset.browser_download_url).getBytes());
+    }
+
     @Getter
     @Setter
-    private static class DownloadAndInstallRequest {
+    private static class DeviceConfig {
+        private final boolean bootOnly = true;
+        public boolean hasInitSetup;
+        public boolean hasUserPassword;
+        private boolean hasKeystore;
+        private Date keystoreDate;
+        private boolean hasApp;
+    }
+
+    @Getter
+    @Setter
+    private static class UserPasswordRequest {
         private String email;
         private String password;
     }
@@ -96,10 +203,13 @@ public class MainController {
     @Getter
     @AllArgsConstructor
     private static class Progress {
-        private final String type = "progress";
-        private final String specifier = "thd";
+        private final Type type;
         private double value;
         private String title;
+
+        private enum Type {
+            download, init
+        }
     }
 
     @Setter
@@ -118,4 +228,23 @@ public class MainController {
             private String updated_at;
         }
     }
+
+    @Getter
+    @Setter
+    private static class KeyStoreRequest {
+        private byte[] ks;
+        private byte[] prvKey;
+        private byte[] pubKey;
+    }
+
+/*
+    # IN CASE OF sub:
+    # export PRIMARY_IP=192.168.0.110
+    # sudo systemctl stop postgresql
+    # sudo -H -u postgres bash -c 'rm -rf $PSQL_DATA_PATH/main/*'
+    # sudo PGPASSWORD="password" -H -u postgres bash -c "pg_basebackup -h $PRIMARY_IP -D /usr/local/pgsql/data -P -U replicator --xlog-method=stream"
+    # sudo sed -i "s/#hot_standby = 'off'/hot_standby = 'on'/g" $PSQL_CONF_PATH/postgresql.conf
+    # echo "standby_mode = 'on'\nprimary_conninfo = 'host=$PRIMARY_IP port=5432 user=replicator password=password'\ntrigger_file = '/var/lib/postgresql/9.6/trigger'\nrestore_command = 'cp /var/lib/postgresql/9.6/archive/%f \"%p\"'" >> $PSQL_DATA_PATH/main/recovery.conf
+    # sudo systemctl start postgresql
+*/
 }

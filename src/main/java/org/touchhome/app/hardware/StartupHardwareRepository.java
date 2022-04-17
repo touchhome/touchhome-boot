@@ -11,4 +11,7 @@ public interface StartupHardwareRepository {
 
     @HardwareQuery(name = "Update app", value = ":path/update.sh")
     String updateApp(@HQueryParam("path") Path path);
+
+    @HardwareQuery(name = "Check psql is running", value = {"service", "postgresql", "status"}, printOutput = true)
+    boolean isPostgreSQLRunning();
 }
