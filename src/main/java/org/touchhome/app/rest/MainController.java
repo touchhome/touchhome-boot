@@ -63,8 +63,11 @@ public class MainController {
     @PostMapping("/app/config/finish")
     public void finishConfiguration() {
         log.info("Update /etc/systemd/system/touchhome.service");
-        // ProcessBuilder pb = new ProcessBuilder(new String[]{"sed", "-i", "'s/boot/core/g'", "/etc/systemd/system/touchhome.service"});
         machineHardwareRepository.executeEcho("sed -i 's/boot/core/g' /etc/systemd/system/touchhome.service");
+        machineHardwareRepository.executeEcho("sed -i '3 i After=postgresql.service' /etc/systemd/system/touchhome.service");
+        machineHardwareRepository.executeEcho("sed -i '4 i Requires=postgresql.service' /etc/systemd/system/touchhome.service");
+        machineHardwareRepository.reboot();
+        // ProcessBuilder pb = new ProcessBuilder(new String[]{"sed", "-i", "'s/boot/core/g'", "/etc/systemd/system/touchhome.service"});
         //  progressBar.progress(100D, "Installation finished.");
             /*if (process.exitValue() == 0) {
                 progressBar.progress(100D, "Installation finished. System reboot fired. Please, reload page in 5 minute...");
@@ -78,6 +81,7 @@ public class MainController {
     public DeviceConfig getConfiguration() throws IOException {
         DeviceConfig deviceConfig = new DeviceConfig();
         deviceConfig.hasApp = Files.exists(CommonUtils.getRootPath().resolve("touchhome-core.jar"));
+        deviceConfig.installingApp = this.installingApp;
         Path prvKey = CommonUtils.getRootPath().resolve("init_private_key");
         deviceConfig.hasKeystore = Files.exists(prvKey);
         deviceConfig.hasInitSetup = isInitSetupDone();
@@ -149,8 +153,11 @@ public class MainController {
             progressBar.progress(100D, "App already downloaded.");
             return;
         }
+        Path tmpPath = CommonUtils.getRootPath().resolve("touchhome-core_tmp.jar");
         try {
             this.installingApp = true;
+            Files.deleteIfExists(tmpPath);
+
             log.info("Installing application...");
             GitHubDescription gitHubDescription = Curl.get("https://api.github.com/repos/touchhome/touchhome-core/releases/latest", GitHubDescription.class);
 
@@ -160,14 +167,15 @@ public class MainController {
             if (asset == null) {
                 throw new NotFoundException("Unable to find touchhome-code.jar asset from server");
             }
-            log.info("Downloading touchhome.jar to <{}>", targetPath);
-            Curl.downloadWithProgress(asset.browser_download_url, targetPath, progressBar);
+            log.info("Downloading touchhome.jar to <{}>", tmpPath);
+            Curl.downloadWithProgress(asset.browser_download_url, tmpPath, progressBar);
 
             // test downloaded file md5 hash
-            if (!md5HashValue.equals(DigestUtils.md5Hex(Files.newInputStream(targetPath)))) {
-                Files.delete(targetPath);
+            if (!md5HashValue.equals(DigestUtils.md5Hex(Files.newInputStream(tmpPath)))) {
+                Files.delete(tmpPath);
                 throw new ServerException("Downloaded file corrupted");
             }
+            Files.move(tmpPath, targetPath);
             log.info("App installation finished");
         } finally {
             installingApp = false;
@@ -186,8 +194,9 @@ public class MainController {
     @Setter
     private static class DeviceConfig {
         private final boolean bootOnly = true;
-        public boolean hasInitSetup;
-        public boolean hasUserPassword;
+        private boolean hasInitSetup;
+        private boolean hasUserPassword;
+        private boolean installingApp;
         private boolean hasKeystore;
         private Date keystoreDate;
         private boolean hasApp;
