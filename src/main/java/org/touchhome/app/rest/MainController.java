@@ -18,6 +18,7 @@ import org.touchhome.common.util.Curl;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.util.ArrayList;
 import java.util.Date;
@@ -36,6 +37,7 @@ public class MainController {
     private final MachineHardwareRepository machineHardwareRepository;
     private final StartupHardwareRepository startupHardwareRepository;
     private boolean installingApp;
+    private boolean initInstalling;
 
     @GetMapping("/auth/status")
     public int getStatus() {
@@ -63,18 +65,10 @@ public class MainController {
     @PostMapping("/app/config/finish")
     public void finishConfiguration() {
         log.info("Update /etc/systemd/system/touchhome.service");
-        machineHardwareRepository.executeEcho("sed -i 's/boot/core/g' /etc/systemd/system/touchhome.service");
-        machineHardwareRepository.executeEcho("sed -i '3 i After=postgresql.service' /etc/systemd/system/touchhome.service");
-        machineHardwareRepository.executeEcho("sed -i '4 i Requires=postgresql.service' /etc/systemd/system/touchhome.service");
+        machineHardwareRepository.execute("sed -i 's/boot/core/g' /etc/systemd/system/touchhome.service");
+        machineHardwareRepository.execute("sed -i '3 i After=postgresql.service' /etc/systemd/system/touchhome.service");
+        machineHardwareRepository.execute("sed -i '4 i Requires=postgresql.service' /etc/systemd/system/touchhome.service");
         machineHardwareRepository.reboot();
-        // ProcessBuilder pb = new ProcessBuilder(new String[]{"sed", "-i", "'s/boot/core/g'", "/etc/systemd/system/touchhome.service"});
-        //  progressBar.progress(100D, "Installation finished.");
-            /*if (process.exitValue() == 0) {
-                progressBar.progress(100D, "Installation finished. System reboot fired. Please, reload page in 5 minute...");
-                machineHardwareRepository.reboot();
-            } else {
-                progressBar.progress(100D, "Something went wrong with installing.");
-            }*/
     }
 
     @GetMapping("/app/config")
@@ -82,6 +76,7 @@ public class MainController {
         DeviceConfig deviceConfig = new DeviceConfig();
         deviceConfig.hasApp = Files.exists(CommonUtils.getRootPath().resolve("touchhome-core.jar"));
         deviceConfig.installingApp = this.installingApp;
+        deviceConfig.initInstalling = this.initInstalling;
         Path prvKey = CommonUtils.getRootPath().resolve("init_private_key");
         deviceConfig.hasKeystore = Files.exists(prvKey);
         deviceConfig.hasInitSetup = isInitSetupDone();
@@ -92,40 +87,54 @@ public class MainController {
 
     @PostMapping("/app/config/init")
     public void initialSetup() {
-        ProgressBar progressBar = (progress, message) ->
-                messagingTemplate.convertAndSend(WebSocketConfig.DESTINATION_PREFIX + "-global", new Progress(Progress.Type.init, progress, message));
-        try {
-            if (!isInitSetupDone()) {
-                machineHardwareRepository.executeEcho("sudo apt-get update");
-                progressBar.progress(20, "");
-                machineHardwareRepository.executeEcho("sudo apt-get full-upgrade");
-                progressBar.progress(50, "");
-                machineHardwareRepository.executeEcho("sudo apt-get install wiringpi");
-                progressBar.progress(60, "");
-                installPostgreSql();
-            }
-            progressBar.progress(100, "Done.");
-        } catch (Exception ex) {
-            progressBar.progress(100, "Error: " + CommonUtils.getErrorMessage(ex));
-            throw new ServerException(ex);
+        if (initInstalling) {
+            throw new ServerException("Already installing...");
         }
+        initInstalling = true;
+        new Thread(() -> {
+            try {
+                ProgressBar progressBar = (progress, message) ->
+                        messagingTemplate.convertAndSend(WebSocketConfig.DESTINATION_PREFIX + "-global", new Progress(Progress.Type.init, progress, message));
+                try {
+                    if (!isInitSetupDone()) {
+                        progressBar.progress(5, "Update os");
+                        machineHardwareRepository.execute("apt-get update", 600, progressBar);
+                        progressBar.progress(20, "Full upgrade os");
+                        machineHardwareRepository.execute("apt-get -y full-upgrade", 1200, progressBar);
+                        // progressBar.progress(50, "Installing wiringpi");
+                        //  machineHardwareRepository.installSoftware("wiringpi", 600, progressBar);
+                        progressBar.progress(60, "Installing Postgresql");
+                        installPostgreSql(progressBar);
+                        machineHardwareRepository.execute("apt-get clean");
+                    }
+                    progressBar.progress(100, "Done.");
+                } catch (Exception ex) {
+                    progressBar.progress(100, "Error: " + CommonUtils.getErrorMessage(ex));
+                    throw new ServerException(ex);
+                }
+            } finally {
+                initInstalling = false;
+            }
+        }).start();
     }
 
     private boolean isInitSetupDone() {
         return machineHardwareRepository.isSoftwareInstalled("psql");
     }
 
-    private void installPostgreSql() {
-        machineHardwareRepository.executeEcho("sudo apt -y install postgresql");
+    private void installPostgreSql(ProgressBar progressBar) {
+        machineHardwareRepository.installSoftware("postgresql", 1200, progressBar);
+        String postgresPath = machineHardwareRepository.execute("find /usr -wholename '*/bin/postgres'");
+        String version = Paths.get(postgresPath).subpath(3, 4).toString();
         for (String config : CommonUtils.readFile("configurePostgresql.conf")) {
-            config = config.replace("$PSQL_CONF_PATH", "/etc/postgresql/9.6/main");
-            machineHardwareRepository.executeEcho(config);
+            config = config.replace("$PSQL_CONF_PATH", "/etc/postgresql/" + version + "/main");
+            machineHardwareRepository.execute(config);
         }
         if (!startupHardwareRepository.isPostgreSQLRunning()) {
             throw new ServerException("Postgresql is not running");
         }
-        machineHardwareRepository.executeEcho("sudo -u postgres /usr/local/pgsql/bin/psql -c \"ALTER user postgres WITH PASSWORD 'password'\"");
-        machineHardwareRepository.executeEcho("sudo -u postgres /usr/local/pgsql/bin/psql -c \"CREATE USER replicator REPLICATION LOGIN CONNECTION LIMIT 1000 ENCRYPTED PASSWORD 'password'\"");
+        machineHardwareRepository.execute("sudo -u postgres psql -c \"ALTER user postgres WITH PASSWORD 'password'\"");
+        // machineHardwareRepository.execute("sudo -u postgres psql -c \"CREATE USER replicator REPLICATION LOGIN CONNECTION LIMIT 1000 ENCRYPTED PASSWORD 'password'\"");
     }
 
     @SneakyThrows
@@ -194,6 +203,7 @@ public class MainController {
     @Setter
     private static class DeviceConfig {
         private final boolean bootOnly = true;
+        public boolean initInstalling;
         private boolean hasInitSetup;
         private boolean hasUserPassword;
         private boolean installingApp;
