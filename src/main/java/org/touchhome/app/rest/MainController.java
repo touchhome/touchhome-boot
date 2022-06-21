@@ -101,9 +101,10 @@ public class MainController {
                         machineHardwareRepository.execute("apt-get update", 600, progressBar);
                         progressBar.progress(20, "Full upgrade os");
                         machineHardwareRepository.execute("apt-get -y full-upgrade", 1200, progressBar);
-                        // progressBar.progress(50, "Installing wiringpi");
-                        //  machineHardwareRepository.installSoftware("wiringpi", 600, progressBar);
-                        progressBar.progress(60, "Installing Postgresql");
+                        machineHardwareRepository.installSoftware("autossh", 60);
+                        progressBar.progress(30, "Install ffmpeg");
+                        machineHardwareRepository.installSoftware("ffmpeg", 600);
+                        progressBar.progress(40, "Installing Postgresql");
                         installPostgreSql(progressBar);
                         machineHardwareRepository.execute("apt-get clean");
                     }
@@ -134,7 +135,7 @@ public class MainController {
             throw new ServerException("Postgresql is not running");
         }
         machineHardwareRepository.execute("sudo -u postgres psql -c \"ALTER user postgres WITH PASSWORD 'password'\"");
-        // machineHardwareRepository.execute("sudo -u postgres psql -c \"CREATE USER replicator REPLICATION LOGIN CONNECTION LIMIT 1000 ENCRYPTED PASSWORD 'password'\"");
+        machineHardwareRepository.execute("sudo -u postgres psql -c \"CREATE ROLE replication WITH REPLICATION PASSWORD 'password' LOGIN\"");
     }
 
     @SneakyThrows
